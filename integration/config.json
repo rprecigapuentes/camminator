@@ -12,15 +12,8 @@
     "front_angle_max1": 60,
     "front_angle_min2": 300,
     "front_angle_max2": 360,
-    "alert_distance": 1000,
-    "distance_threshold": 50,
-    "angle_gap_threshold": 5,
-    "min_points_per_object": 3,
-    "buffer_size": 150,
-    "object_distance_threshold": 100,
-    "object_angle_threshold": 15,
-    "min_time_between_alerts": 2.0,
-    "process_every_n_points": 40
+    "max_considered_mm": 2000,
+    "publish_every_s": 0.1
   },
   "asistente": {
     "whisper_model": "base",
@@ -35,9 +28,9 @@
     "button_pin": 17
   },
   "sistema": {
-    "min_proximity_distance": 1.5
-  },
-  "debug": {
-    "print_period_s": 0.5
+    "alert_distance_mm": 1000,
+    "min_alert_interval_s": 2.0,
+    "console_every_s": 0.5,
+    "show_window": true
   }
 }
