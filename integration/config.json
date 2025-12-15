@@ -1,35 +1,43 @@
 {
-    "yolo": {
-        "model_path": "ruta/a/tu/modelo.pt",
-        "camera_source": "usb0",
-        "threshold": 0.5,
-        "resolution": "640x480"
-    },
-    "lidar": {
-        "port": "/dev/ttyUSB0",
-        "baudrate": 115200,
-        "motor_pwm": 500,
-        "front_angle_min1": 0,
-        "front_angle_max1": 60,
-        "front_angle_min2": 300,
-        "front_angle_max2": 360,
-        "alert_distance": 1000,
-        "distance_threshold": 50,
-        "angle_gap_threshold": 5
-    },
-    "asistente": {
-        "whisper_model": "base",
-        "ollama_url": "http://localhost:11434/api/chat",
-        "ollama_model": "tinyllama",
-        "audio_rate": 48000,
-        "audio_channels": 1,
-        "audio_chunk": 256,
-        "record_seconds": 5
-    },
-    "gpio": {
-        "button_pin": 17
-    },
-    "sistema": {
-        "min_proximity_distance": 1.5
-    }
+  "yolo": {
+    "model_path": "yolo11n_ncnn_model",
+    "threshold": 0.5,
+    "resolution": "640x480"
+  },
+  "lidar": {
+    "port": "/dev/ttyUSB0",
+    "baudrate": 469800,
+    "motor_pwm": 500,
+    "front_angle_min1": 0,
+    "front_angle_max1": 60,
+    "front_angle_min2": 300,
+    "front_angle_max2": 360,
+    "alert_distance": 1000,
+    "distance_threshold": 50,
+    "angle_gap_threshold": 5,
+    "min_points_per_object": 3,
+    "buffer_size": 150,
+    "object_distance_threshold": 100,
+    "object_angle_threshold": 15,
+    "min_time_between_alerts": 2.0,
+    "process_every_n_points": 40
+  },
+  "asistente": {
+    "whisper_model": "base",
+    "ollama_url": "http://localhost:11434/api/chat",
+    "ollama_model": "tinyllama",
+    "audio_rate": 48000,
+    "audio_channels": 1,
+    "record_seconds": 5,
+    "alsa_capture_device": "plughw:2,0"
+  },
+  "gpio": {
+    "button_pin": 17
+  },
+  "sistema": {
+    "min_proximity_distance": 1.5
+  },
+  "debug": {
+    "print_period_s": 0.5
+  }
 }

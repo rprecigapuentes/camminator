@@ -1,3 +1,4 @@
+# sistema_integrado.py
 import threading
 import time
 import cv2
@@ -15,6 +16,7 @@ from gpiozero import Button
 from ultralytics import YOLO
 from picamera2 import Picamera2
 
+
 # --------------------------
 # CONFIG
 # --------------------------
@@ -23,10 +25,41 @@ try:
         CONFIG = json.load(f)
 except FileNotFoundError:
     print("ERROR: El archivo 'config.json' no fue encontrado.")
-    sys.exit(0)
+    sys.exit(1)
 except json.JSONDecodeError:
     print("ERROR: El archivo 'config.json' tiene un formato inválido.")
-    sys.exit(0)
+    sys.exit(1)
+
+
+# --------------------------
+# Helpers: regiones + debug
+# --------------------------
+def region_from_x(cx: int, frame_w: int) -> str:
+    z = frame_w // 3
+    if cx < z:
+        return "LEFT"
+    if cx < 2 * z:
+        return "CENTER"
+    return "RIGHT"
+
+
+def region_from_lidar_angle_front(angle_deg: float) -> str:
+    """
+    Tu LiDAR frontal está en 0..60 (derecha) y 300..360 (izquierda).
+    Centro aproximado: 330..360 y 0..30.
+    """
+    a = angle_deg % 360.0
+    if (330.0 <= a <= 360.0) or (0.0 <= a <= 30.0):
+        return "CENTER"
+    if 300.0 <= a <= 360.0:
+        return "LEFT"
+    if 0.0 <= a <= 60.0:
+        return "RIGHT"
+    return "UNKNOWN"
+
+
+def fmt_mm(x):
+    return "None" if x is None else f"{x:.0f} mm"
 
 
 # --------------------------
@@ -40,8 +73,7 @@ class SharedState:
             "lidar_objects": {},
             "proximity_alert": None,
             "llm_response": None,
-            "current_speech_action": None,  # 'proximity_alert', 'llm_response', None
-            "stop_speech_flag": threading.Event(),
+            "current_speech_action": None,
         }
 
     def get(self, key):
@@ -60,7 +92,6 @@ class SharedState:
         with self._lock:
             self._data["proximity_alert"] = alert_data
             self._data["current_speech_action"] = "proximity_alert"
-            self._data["stop_speech_flag"].set()
 
     def set_llm_response(self, response_text):
         with self._lock:
@@ -71,24 +102,16 @@ class SharedState:
     def clear_speech_action(self):
         with self._lock:
             self._data["current_speech_action"] = None
-            self._data["stop_speech_flag"].clear()
 
 
 # --------------------------
 # LIDAR THREAD (SMART + AUTO-RECOVERY)
 # --------------------------
 def lidar_process(shared_state):
-    """
-    Hilo LIDAR: copia la lógica smart del standalone (buffer+agrupación+fusión),
-    publica objetos en shared_state.update_lidar_objects().
-
-    Incluye auto-recovery si el LIDAR se desincroniza (sync bytes mismatched).
-    """
     print("[Hilo - LIDAR] Iniciando LIDAR (modo smart + auto-recovery)...")
 
     from pyrplidar import PyRPlidar
 
-    # Helpers
     def angle_difference(a1, a2):
         diff = abs(a1 - a2)
         return min(diff, 360 - diff)
@@ -105,7 +128,6 @@ def lidar_process(shared_state):
         angles = [p[0] for p in group]
         dists = [p[1] for p in group]
 
-        # promedio circular
         x_sum = 0.0
         y_sum = 0.0
         for ang in angles:
@@ -129,10 +151,9 @@ def lidar_process(shared_state):
         else:
             angle_span = 0.0
 
+        width_est = 0.0
         if angle_span > 0.1 and avg_d > 0:
             width_est = 2 * avg_d * math.tan(math.radians(angle_span / 2))
-        else:
-            width_est = 0.0
 
         if 0 <= avg_angle <= 60:
             pos = "FRONTAL DERECHO"
@@ -205,7 +226,6 @@ def lidar_process(shared_state):
                 return False
         return True
 
-    # Params
     FRONT_ANGLE_MIN1 = float(CONFIG["lidar"].get("front_angle_min1", 0))
     FRONT_ANGLE_MAX1 = float(CONFIG["lidar"].get("front_angle_max1", 60))
     FRONT_ANGLE_MIN2 = float(CONFIG["lidar"].get("front_angle_min2", 300))
@@ -226,7 +246,6 @@ def lidar_process(shared_state):
     baud = int(CONFIG["lidar"]["baudrate"])
     pwm = int(CONFIG["lidar"]["motor_pwm"])
 
-    # Auto-recovery outer loop
     while True:
         lidar = PyRPlidar()
         try:
@@ -268,13 +287,12 @@ def lidar_process(shared_state):
                             for obj in merged:
                                 info = obj["info"]
                                 if info and should_alert_for_object(info, alert_history):
+                                    ang = float(info["avg_angle"])
                                     out[f"objeto_{idx}"] = {
-                                        "angle": float(info["avg_angle"]),
+                                        "angle": ang,
                                         "distance": float(info["min_distance"]),  # mm
+                                        "region": region_from_lidar_angle_front(ang),
                                         "position": info["position"],
-                                        "width_est": float(info["width_est"]),
-                                        "angle_span": float(info["angle_span"]),
-                                        "point_count": int(info["point_count"]),
                                         "timestamp": float(info["timestamp"]),
                                     }
                                     idx += 1
@@ -282,14 +300,12 @@ def lidar_process(shared_state):
 
                     shared_state.update_lidar_objects(out)
 
-                    # housekeeping
                     alert_history = [(t, obj) for t, obj in alert_history if (now - t) < 10.0]
                     if len(point_buffer) > int(BUFFER_SIZE * 0.8):
                         point_buffer = point_buffer[-int(BUFFER_SIZE * 0.7):]
 
         except Exception as e:
             print(f"[Hilo - LIDAR] ERROR critico: {e}")
-            # recovery wait
             time.sleep(1.0)
 
         finally:
@@ -306,12 +322,11 @@ def lidar_process(shared_state):
             except Exception:
                 pass
 
-        # reintenta
         time.sleep(0.8)
 
 
 # --------------------------
-# AUDIO/LLM THREAD (ARECORD + WHISPER)
+# AUDIO/LLM THREAD (ARECORD + WHISPER) - FIXED
 # --------------------------
 def audio_llm_process(shared_state, button):
     print("[Hilo - Audio/LLM] Iniciando. Esperando activación por botón...")
@@ -319,44 +334,62 @@ def audio_llm_process(shared_state, button):
     try:
         import whisper
         model = whisper.load_model(CONFIG["asistente"]["whisper_model"])
-    except ImportError:
-        print("[Hilo - Audio/LLM] ERROR: falta whisper. pip install openai-whisper")
+    except Exception as e:
+        print(f"[Hilo - Audio/LLM] ERROR: Whisper no disponible: {e}")
         return
 
     def record_audio_arecord() -> str:
         """
-        Graba WAV con arecord usando el device ALSA explícito (plughw:2,0 / hw:2,0).
+        FIXES:
+        - Usa -q (silencioso) pero si falla, imprime error.
+        - Timeout duro para que nunca se quede colgado.
+        - Duración con ceil.
         """
         alsa_dev = CONFIG["asistente"].get("alsa_capture_device", "plughw:2,0")
-        rate = int(CONFIG["asistente"]["audio_rate"])
-        channels = int(CONFIG["asistente"]["audio_channels"])
-        seconds = float(CONFIG["asistente"]["record_seconds"])
+        rate = int(CONFIG["asistente"].get("audio_rate", 48000))
+        channels = int(CONFIG["asistente"].get("audio_channels", 1))
+        seconds = float(CONFIG["asistente"].get("record_seconds", 5))
 
         fd, wav_path = tempfile.mkstemp(prefix="mic_", suffix=".wav")
         os.close(fd)
 
         cmd = [
             "arecord",
+            "-q",
             "-D", alsa_dev,
             "-f", "S16_LE",
             "-r", str(rate),
             "-c", str(channels),
-            "-d", str(int(seconds)),
-            wav_path
+            "-d", str(int(math.ceil(seconds))),
+            wav_path,
         ]
 
-        # Silenciar salida para que no ensucie logs
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # timeout: duración + margen
+        try:
+            subprocess.run(
+                cmd,
+                check=True,
+                timeout=seconds + 3.0,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("arecord timeout: se colgó el capture device.")
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"arecord falló: {e.stderr.strip() or e.stdout.strip() or str(e)}")
+
+        # sanity: WAV válido
+        if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 44:
+            raise RuntimeError("WAV inválido: archivo muy pequeño o no se escribió.")
+
         return wav_path
 
-    def load_wav_float32(path: str) -> np.ndarray:
-        """
-        Lee WAV 16-bit PCM y devuelve float32 mono en [-1,1].
-        (sin dependencias externas)
-        """
+    def load_wav_float32(path: str) -> tuple[np.ndarray, int]:
         with wave.open(path, "rb") as wf:
             n_channels = wf.getnchannels()
             sampwidth = wf.getsampwidth()
+            framerate = wf.getframerate()
             n_frames = wf.getnframes()
             raw = wf.readframes(n_frames)
 
@@ -366,10 +399,24 @@ def audio_llm_process(shared_state, button):
         audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
         if n_channels > 1:
             audio = audio.reshape(-1, n_channels).mean(axis=1)
-        return audio
+        return audio, framerate
 
-    def preguntar_llm(texto_usuario):
-        print("[+] Enviando texto a Ollama...")
+    def resample_to_16k(audio: np.ndarray, sr: int) -> np.ndarray:
+        # tu caso: 48000 -> 16000 (decimación x3)
+        if sr == 48000:
+            return audio[::3].astype(np.float32)
+        if sr == 16000:
+            return audio.astype(np.float32)
+
+        # fallback interpolación lineal
+        target_sr = 16000
+        duration = len(audio) / float(sr)
+        t_old = np.linspace(0.0, duration, num=len(audio), endpoint=False)
+        n_new = max(1, int(duration * target_sr))
+        t_new = np.linspace(0.0, duration, num=n_new, endpoint=False)
+        return np.interp(t_new, t_old, audio).astype(np.float32)
+
+    def preguntar_llm(texto_usuario: str) -> str:
         payload = {
             "model": CONFIG["asistente"]["ollama_model"],
             "stream": False,
@@ -383,27 +430,30 @@ def audio_llm_process(shared_state, button):
             resp.raise_for_status()
             data = resp.json()
             return data["message"]["content"].strip()
-        except requests.exceptions.RequestException as e:
-            print(f"[!] Error al contactar con Ollama: {e}")
-            return "Lo siento, no pude contactar al modelo de lenguaje."
+        except Exception as e:
+            return f"No pude contactar el LLM: {e}"
 
     while True:
         button.wait_for_press()
-        print("[Hilo - Audio/LLM] Botón presionado. Grabando con arecord...")
+        print("[Hilo - Audio/LLM] Botón presionado. Grabando audio...")
 
         try:
             wav_path = record_audio_arecord()
+            print(f"[Hilo - Audio/LLM] WAV listo: {wav_path}")
         except Exception as e:
-            print(f"[Hilo - Audio/LLM] ERROR grabando con arecord: {e}")
-            time.sleep(0.5)
+            print(f"[Hilo - Audio/LLM] ERROR grabando: {e}")
+            time.sleep(0.3)
             continue
 
         try:
-            audio_np = load_wav_float32(wav_path)
-            result = model.transcribe(audio_np, fp16=False, language="es")
-            texto = result.get("text", "").strip()
+            audio, sr = load_wav_float32(wav_path)
+            audio16 = resample_to_16k(audio, sr)
+
+            print(f"[Hilo - Audio/LLM] Transcribiendo (sr={sr} -> 16000, samples={len(audio16)})...")
+            result = model.transcribe(audio16, fp16=False, language="es")
+            texto = (result.get("text") or "").strip()
         except Exception as e:
-            print(f"[Hilo - Audio/LLM] ERROR en Whisper/transcripción: {e}")
+            print(f"[Hilo - Audio/LLM] ERROR whisper/transcribe: {e}")
             texto = ""
         finally:
             try:
@@ -411,11 +461,15 @@ def audio_llm_process(shared_state, button):
             except Exception:
                 pass
 
-        if texto:
-            print(f"Usuario pregunta: {texto}")
-            llm_response = preguntar_llm(texto)
-            if llm_response:
-                shared_state.set_llm_response(llm_response)
+        if not texto:
+            print("[Hilo - Audio/LLM] Transcripción vacía.")
+            continue
+
+        print(f"[Hilo - Audio/LLM] Usuario: {texto}")
+        respuesta = preguntar_llm(texto)
+        print(f"[Hilo - Audio/LLM] LLM: {respuesta}")
+        if respuesta:
+            shared_state.set_llm_response(respuesta)
 
         time.sleep(0.2)
 
@@ -428,8 +482,8 @@ def tts_process(shared_state):
     try:
         import pyttsx3
         engine = pyttsx3.init()
-    except ImportError:
-        print("[Hilo - TTS] ERROR: falta pyttsx3. pip install pyttsx3")
+    except Exception as e:
+        print(f"[Hilo - TTS] ERROR pyttsx3: {e}")
         return
 
     while True:
@@ -456,14 +510,13 @@ def tts_process(shared_state):
 
 
 # --------------------------
-# MAIN (YOLO LOOP)
+# MAIN (YOLO LOOP + CONSOLE DEBUG)
 # --------------------------
 def main():
     print("[Main] Iniciando sistema principal...")
-
     shared_state = SharedState()
 
-    # YOLO + camera
+    # YOLO + CSI camera (Picamera2)
     model = YOLO(CONFIG["yolo"]["model_path"], task="detect")
     labels = model.names
 
@@ -477,7 +530,6 @@ def main():
     picam2.start()
     time.sleep(1)
 
-    # GPIO
     button = Button(CONFIG["gpio"]["button_pin"])
 
     # threads
@@ -487,9 +539,12 @@ def main():
 
     print("[Main] Hilos secundarios iniciados. Iniciando bucle YOLO.")
 
-    zone_colors = {"left": (0, 0, 255), "center": (0, 255, 0), "right": (255, 0, 0)}
+    zone_colors = {"LEFT": (0, 0, 255), "CENTER": (0, 255, 0), "RIGHT": (255, 0, 0)}
     frame_rate_buffer = []
     fps_avg_len = 200
+
+    debug_period = float(CONFIG.get("debug", {}).get("print_period_s", 0.5))
+    last_debug = 0.0
 
     try:
         while True:
@@ -499,14 +554,22 @@ def main():
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
             frame_h, frame_w, _ = frame.shape
-            zone_width = frame_w // 3
-            x_left_max = zone_width
-            x_center_min = zone_width
-            x_center_max = 2 * zone_width
-            x_right_min = 2 * zone_width
+            z = frame_w // 3
 
             results = model(frame, verbose=False)
             detections = results[0].boxes
+
+            lidar_objects = shared_state.get("lidar_objects") or {}
+
+            # LiDAR min por región (para consola)
+            lidar_min_by_region = {"LEFT": None, "CENTER": None, "RIGHT": None}
+            for obj in lidar_objects.values():
+                reg = obj.get("region")
+                dmm = obj.get("distance")
+                if reg in lidar_min_by_region and dmm is not None:
+                    prev = lidar_min_by_region[reg]
+                    lidar_min_by_region[reg] = dmm if (prev is None or dmm < prev) else prev
+
             detected_objects = {}
 
             for i in range(len(detections)):
@@ -516,60 +579,57 @@ def main():
                 classname = labels[classidx]
                 conf = float(detections[i].conf.item())
 
-                if conf > float(CONFIG["yolo"]["threshold"]):
-                    bbox_center_x = xmin + (xmax - xmin) // 2
+                if conf <= float(CONFIG["yolo"]["threshold"]):
+                    continue
 
-                    angle_rad = math.atan2(bbox_center_x - (frame_w / 2), (frame_h / 2))
-                    angle_deg = math.degrees(angle_rad)
+                cx = xmin + (xmax - xmin) // 2
+                reg = region_from_x(cx, frame_w)
 
-                    lidar_objects = shared_state.get("lidar_objects") or {}
-                    min_distance = float("inf")
+                # ángulo relativo a centro (tu fórmula)
+                angle_rad = math.atan2(cx - (frame_w / 2), (frame_h / 2))
+                angle_deg = float(math.degrees(angle_rad))
 
-                    for obj_data in lidar_objects.values():
-                        if abs(angle_deg - obj_data["angle"]) < 20:
-                            if obj_data["distance"] < min_distance:
-                                min_distance = obj_data["distance"]
+                # asociación LiDAR por ángulo
+                min_distance_mm = float("inf")
+                for obj_data in lidar_objects.values():
+                    a = float(obj_data.get("angle", 0.0))
+                    d = float(obj_data.get("distance", 0.0))
+                    if d > 0 and abs(angle_deg - a) < 20:
+                        if d < min_distance_mm:
+                            min_distance_mm = d
 
-                    detected_objects[classname] = {
-                        "bbox": (xmin, ymin, xmax, ymax),
-                        "angle": angle_deg,
-                        "distance": (min_distance / 1000.0) if min_distance != float("inf") else 0.0,
-                    }
+                dist_m = (min_distance_mm / 1000.0) if min_distance_mm != float("inf") else 0.0
 
-                    if bbox_center_x < x_left_max:
-                        color = zone_colors["left"]
-                    elif bbox_center_x < x_center_max:
-                        color = zone_colors["center"]
-                    else:
-                        color = zone_colors["right"]
+                key = f"{classname}_{i}"
+                detected_objects[key] = {
+                    "name": classname,
+                    "bbox": (xmin, ymin, xmax, ymax),
+                    "region": reg,
+                    "angle": angle_deg,
+                    "distance_m": dist_m,
+                    "conf": conf,
+                }
 
-                    cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
-                    label = f"{classname}: {int(conf*100)}%"
-                    labelSize, baseLine = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-                    label_ymin = max(ymin, labelSize[1] + 10)
-                    cv2.rectangle(
-                        frame,
-                        (xmin, label_ymin - labelSize[1] - 10),
-                        (xmin + labelSize[0], label_ymin + baseLine - 10),
-                        color,
-                        cv2.FILLED,
-                    )
-                    cv2.putText(frame, label, (xmin, label_ymin - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+                color = zone_colors[reg]
+                cv2.rectangle(frame, (xmin, ymin), (xmax, ymax), color, 2)
+                cv2.putText(frame, f"{classname} {int(conf*100)}%", (xmin, max(20, ymin - 5)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
 
             shared_state.update_detections(detected_objects)
 
-            for obj_name, data in detected_objects.items():
-                if 0 < data["distance"] < float(CONFIG["sistema"]["min_proximity_distance"]):
-                    print(f"[Main] Objeto {obj_name} en proximidad. Disparando alerta.")
-                    shared_state.set_proximity_alert({"name": obj_name, "distance": data["distance"]})
+            # proximidad
+            for _, data in detected_objects.items():
+                d = float(data["distance_m"])
+                if 0 < d < float(CONFIG["sistema"]["min_proximity_distance"]):
+                    print(f"[Main] Proximidad: {data['name']} ({d:.2f} m)")
+                    shared_state.set_proximity_alert({"name": data["name"], "distance": d})
                     break
 
-            cv2.line(frame, (x_left_max, 0), (x_left_max, frame_h), (255, 255, 0), 2)
-            cv2.line(frame, (x_center_max, 0), (x_center_max, frame_h), (255, 255, 0), 2)
-            cv2.putText(frame, "IZQUIERDA", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            cv2.putText(frame, "CENTRO", (x_center_min + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(frame, "DERECHA", (x_right_min + 10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            # UI regiones
+            cv2.line(frame, (z, 0), (z, frame_h), (255, 255, 0), 2)
+            cv2.line(frame, (2 * z, 0), (2 * z, frame_h), (255, 255, 0), 2)
 
+            # FPS
             t_stop = time.perf_counter()
             fps = float(1.0 / (t_stop - t_start))
             if len(frame_rate_buffer) >= fps_avg_len:
@@ -582,6 +642,31 @@ def main():
             cv2.imshow("Sistema Integrado", frame)
             if cv2.waitKey(1) == ord("q"):
                 break
+
+            # --------------------------
+            # CONSOLE DEBUG (3 cosas)
+            # --------------------------
+            now = time.time()
+            if (now - last_debug) >= debug_period:
+                last_debug = now
+
+                # 1) YOLO salida por región (etiquetas)
+                yolo_by_region = {"LEFT": [], "CENTER": [], "RIGHT": []}
+                for d in detected_objects.values():
+                    yolo_by_region[d["region"]].append(d["name"])
+
+                # 2) LiDAR por región (dist min)
+                print("\n=== DEBUG ===")
+                print(f"YOLO: LEFT={yolo_by_region['LEFT']} | CENTER={yolo_by_region['CENTER']} | RIGHT={yolo_by_region['RIGHT']}")
+                print(f"LIDAR(min): LEFT={fmt_mm(lidar_min_by_region['LEFT'])} | CENTER={fmt_mm(lidar_min_by_region['CENTER'])} | RIGHT={fmt_mm(lidar_min_by_region['RIGHT'])}")
+
+                # 3) Asociación YOLO<->LiDAR
+                for k, d in detected_objects.items():
+                    reg = d["region"]
+                    print(
+                        f"ASSOC: {k} -> region={reg} | yolo_angle={d['angle']:.1f}° | "
+                        f"lidar_by_angle={d['distance_m']:.2f} m | lidar_min_region={fmt_mm(lidar_min_by_region[reg])}"
+                    )
 
     finally:
         try:
