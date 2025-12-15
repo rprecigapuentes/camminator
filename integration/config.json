@@ -12,8 +12,11 @@
     "front_angle_max1": 60,
     "front_angle_min2": 300,
     "front_angle_max2": 360,
-    "max_considered_mm": 2000,
-    "publish_every_s": 0.1
+    "alert_distance": 1000,
+
+    "publish_every_s": 0.15,
+    "min_valid_mm": 80,
+    "max_valid_mm": 6000
   },
   "asistente": {
     "whisper_model": "base",
@@ -21,20 +24,13 @@
     "ollama_model": "tinyllama",
     "audio_rate": 48000,
     "audio_channels": 1,
-    "record_seconds": 5,
+    "record_seconds": 4,
     "alsa_capture_device": "plughw:2,0"
   },
   "gpio": {
     "button_pin": 17
   },
   "sistema": {
-    "alert_distance_mm": 1000,
-    "min_alert_interval_s": 2.0,
-    "console_every_s": 0.5,
-    "show_window": true
-  },
-  "tts": {
-    "rate": 175,
-    "volume": 1.0
+    "alert_cooldown_s": 2.0
   }
 }
