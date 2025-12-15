@@ -1,36 +1,22 @@
 {
   "yolo": {
     "model_path": "yolo11n_ncnn_model",
-    "threshold": 0.5,
-    "resolution": "640x480"
+    "threshold": 0.5
   },
   "lidar": {
     "port": "/dev/ttyUSB0",
     "baudrate": 469800,
-    "motor_pwm": 500,
-    "front_angle_min1": 0,
-    "front_angle_max1": 60,
-    "front_angle_min2": 300,
-    "front_angle_max2": 360,
-    "alert_distance": 1000,
-
-    "publish_every_s": 0.15,
-    "min_valid_mm": 80,
-    "max_valid_mm": 6000
+    "motor_pwm": 500
   },
   "asistente": {
     "whisper_model": "base",
     "ollama_url": "http://localhost:11434/api/chat",
     "ollama_model": "tinyllama",
     "audio_rate": 48000,
-    "audio_channels": 1,
-    "record_seconds": 4,
+    "record_seconds": 5,
     "alsa_capture_device": "plughw:2,0"
   },
   "gpio": {
-    "button_pin": 17
-  },
-  "sistema": {
-    "alert_cooldown_s": 2.0
+    "button_pin": 4
   }
 }
