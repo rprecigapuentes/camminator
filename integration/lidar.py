@@ -1,16 +1,18 @@
 def lidar_process(shared_state):
     """
-    Hilo LIDAR: detección inteligente con buffer + agrupación + fusión (igual al script standalone),
-    pero en vez de imprimir, publica objetos en shared_state.update_lidar_objects().
+    Hilo LIDAR robusto:
+    - Conecta una vez y escanea continuamente.
+    - Si hay desincronización/USB falla, hace cleanup y reintenta (sin morir el hilo).
+    - Publica objetos en shared_state.update_lidar_objects().
     """
 
-    print("[Hilo - LIDAR] Iniciando LIDAR (modo smart)...")
+    print("[Hilo - LIDAR] Iniciando LIDAR (modo smart + auto-recovery)...")
 
     from pyrplidar import PyRPlidar
     import time
     import math
 
-    # --- Helpers (copiados del script que funciona) ---
+    # ---------- Helpers (idénticos al standalone) ----------
     def angle_difference(angle1, angle2):
         diff = abs(angle1 - angle2)
         return min(diff, 360 - diff)
@@ -33,7 +35,6 @@ def lidar_process(shared_state):
         angles = [p[0] for p in group]
         distances = [p[1] for p in group]
 
-        # promedio circular del ángulo
         x_sum = 0.0
         y_sum = 0.0
         for ang in angles:
@@ -145,7 +146,7 @@ def lidar_process(shared_state):
                     return False
         return True
 
-    # --- Parámetros: preferimos CONFIG, pero caemos a defaults del script ---
+    # ---------- Params (del CONFIG, con defaults razonables) ----------
     FRONT_ANGLE_MIN1 = float(CONFIG["lidar"].get("front_angle_min1", 0))
     FRONT_ANGLE_MAX1 = float(CONFIG["lidar"].get("front_angle_max1", 60))
     FRONT_ANGLE_MIN2 = float(CONFIG["lidar"].get("front_angle_min2", 300))
@@ -154,42 +155,49 @@ def lidar_process(shared_state):
     ALERT_DISTANCE = float(CONFIG["lidar"].get("alert_distance", 1000))  # mm
 
     DISTANCE_THRESHOLD = float(CONFIG["lidar"].get("distance_threshold", 50))  # mm
-    ANGLE_THRESHOLD = float(CONFIG["lidar"].get("angle_gap_threshold", 5))     # grados
+    ANGLE_THRESHOLD = float(CONFIG["lidar"].get("angle_gap_threshold", 5))     # deg
 
-    MIN_POINTS_PER_OBJECT = 3
+    MIN_POINTS_PER_OBJECT = int(CONFIG["lidar"].get("min_points_per_object", 3))
     BUFFER_SIZE = int(CONFIG["lidar"].get("buffer_size", 150))
 
     OBJECT_DISTANCE_THRESHOLD = float(CONFIG["lidar"].get("object_distance_threshold", 100))  # mm
-    OBJECT_ANGLE_THRESHOLD = float(CONFIG["lidar"].get("object_angle_threshold", 15))         # grados
+    OBJECT_ANGLE_THRESHOLD = float(CONFIG["lidar"].get("object_angle_threshold", 15))         # deg
     MIN_TIME_BETWEEN_ALERTS = float(CONFIG["lidar"].get("min_time_between_alerts", 2.0))      # s
 
     PROCESS_EVERY_N_POINTS = int(CONFIG["lidar"].get("process_every_n_points", 40))
 
-    # --- Conexión LIDAR ---
-    lidar = PyRPlidar()
+    PORT = CONFIG["lidar"]["port"]
+    BAUD = int(CONFIG["lidar"]["baudrate"])
+    MOTOR_PWM = int(CONFIG["lidar"]["motor_pwm"])
+    TIMEOUT = float(CONFIG["lidar"].get("timeout", 3))
 
-    try:
-        lidar.connect(
-            port=CONFIG["lidar"]["port"],
-            baudrate=int(CONFIG["lidar"]["baudrate"]),  # IMPORTANTE: en tu caso real debe ser 469800
-            timeout=3,
-        )
-        lidar.set_motor_pwm(int(CONFIG["lidar"]["motor_pwm"]))
-        time.sleep(2)
+    # ---------- Recovery loop ----------
+    backoff_s = 1.0
+    while True:
+        lidar = PyRPlidar()
+        try:
+            # 1) conectar
+            lidar.connect(port=PORT, baudrate=BAUD, timeout=TIMEOUT)
+            lidar.set_motor_pwm(MOTOR_PWM)
+            time.sleep(2.0)
 
-        scan_generator = lidar.force_scan()
+            # 2) arrancar scan (igual que standalone)
+            scan_generator = lidar.force_scan()
 
-        point_buffer = []
-        alert_history = []
-        total_points = 0
+            # 3) buffers / estado
+            point_buffer = []
+            alert_history = []
+            total_points = 0
 
-        while True:
-            # CLAVE: igual que el script que funciona (scan_generator())
+            print("[Hilo - LIDAR] Conectado y escaneando.")
+
             for scan in scan_generator():
                 total_points += 1
 
                 raw_angle = scan.angle
                 distance = scan.distance
+                if distance <= 0:
+                    continue
 
                 angle = normalize_angle(raw_angle)
 
@@ -198,22 +206,20 @@ def lidar_process(shared_state):
                     or (FRONT_ANGLE_MIN2 <= angle <= FRONT_ANGLE_MAX2)
                 )
 
-                if in_frontal and distance > 0 and distance <= ALERT_DISTANCE * 1.2:
+                if in_frontal and distance <= ALERT_DISTANCE * 1.2:
                     point_buffer.append((angle, distance))
                     if len(point_buffer) > BUFFER_SIZE:
                         point_buffer = point_buffer[-BUFFER_SIZE:]
 
-                # Procesar cada N puntos (igual lógica)
+                # procesar cada N puntos (idéntico enfoque del standalone)
                 if total_points % PROCESS_EVERY_N_POINTS == 0:
                     now = time.time()
-
                     critical_points = [(a, d) for a, d in point_buffer if 0 < d <= ALERT_DISTANCE]
 
                     lidar_objects_out = {}
 
                     if len(critical_points) >= MIN_POINTS_PER_OBJECT * 2:
                         point_groups = group_points_by_distance_and_angle(critical_points)
-
                         if point_groups:
                             merged_objects = merge_object_groups(point_groups)
 
@@ -223,40 +229,47 @@ def lidar_process(shared_state):
                                 if obj_info is None:
                                     continue
 
-                                # mismo throttling de alertas (si quieres usarlo)
                                 if should_alert_for_object(obj_info, alert_history):
                                     lidar_objects_out[f"objeto_{obj_idx}"] = {
                                         "angle": float(obj_info["avg_angle"]),
                                         "distance": float(obj_info["min_distance"]),  # mm
                                         "position": obj_info["position"],
-                                        "width_est": float(obj_info["width_est"]),
-                                        "angle_span": float(obj_info["angle_span"]),
-                                        "point_count": int(obj_info["point_count"]),
-                                        "timestamp": float(obj_info["timestamp"]),
                                     }
                                     obj_idx += 1
-
-                                    # registrar en historial para no spamear
                                     alert_history.append((now, obj_info))
 
-                    # publicar objetos (vacío si no hay)
                     shared_state.update_lidar_objects(lidar_objects_out)
 
-                    # limpiar historial viejo (últimos 10 s)
+                    # limpiar historial viejo
                     alert_history = [(t, obj) for t, obj in alert_history if (now - t) < 10.0]
 
-                    # limpieza del buffer (igual que script)
+                    # limpiar buffer si crece mucho
                     if len(point_buffer) > int(BUFFER_SIZE * 0.8):
                         point_buffer = point_buffer[-int(BUFFER_SIZE * 0.7):]
 
-    except Exception as e:
-        print(f"[Hilo - LIDAR] ERROR critico: {e}")
+            # si sale del for, es raro (normalmente sale por excepción)
+            raise RuntimeError("Scan generator terminó inesperadamente")
 
-    finally:
-        print("[Hilo - LIDAR] Deteniendo LIDAR...")
-        try:
-            lidar.stop()
-            lidar.set_motor_pwm(0)
-            lidar.disconnect()
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Hilo - LIDAR] FALLO: {e}")
+            # opcional: publicar vacío para que el resto del sistema no use datos viejos
+            shared_state.update_lidar_objects({})
+            time.sleep(backoff_s)
+            backoff_s = min(backoff_s * 2.0, 10.0)  # backoff hasta 10s
+
+        finally:
+            try:
+                lidar.stop()
+            except Exception:
+                pass
+            try:
+                lidar.set_motor_pwm(0)
+            except Exception:
+                pass
+            try:
+                lidar.disconnect()
+            except Exception:
+                pass
+
+            # al salir por error, reintentamos (sin morir el hilo)
+            print("[Hilo - LIDAR] Cleanup completo. Reintentando conexión...")
