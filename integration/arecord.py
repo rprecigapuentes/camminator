@@ -1,4 +1,4 @@
-# sistema_minimo_v2.py
+# sistema_minimo_v3.py
 import os
 import sys
 import json
@@ -67,7 +67,7 @@ class SharedState:
 
 
 # --------------------------
-# TTS (speaker)
+# TTS
 # --------------------------
 class Speaker:
     def __init__(self):
@@ -79,7 +79,6 @@ class Speaker:
         try:
             import pyttsx3
             self._engine = pyttsx3.init()
-            # Opcional: ajustar velocidad/volumen
             rate = CONFIG.get("tts", {}).get("rate", None)
             volume = CONFIG.get("tts", {}).get("volume", None)
             if rate is not None:
@@ -96,7 +95,7 @@ class Speaker:
         if self._engine is None:
             print("[TTS] No disponible. Texto:", text)
             return
-        # Evitar que se pisen mensajes
+
         def _run():
             with self._lock:
                 try:
@@ -104,23 +103,42 @@ class Speaker:
                     self._engine.runAndWait()
                 except Exception as e:
                     print(f"[TTS] ERROR hablando: {e}")
+
         threading.Thread(target=_run, daemon=True).start()
 
 
 # --------------------------
-# OLLAMA
+# OLLAMA (ENGLISH)
 # --------------------------
-def ask_ollama(text: str) -> str:
+def ask_ollama_english(user_question_en: str, yolo_labels, lidar_mm) -> str:
+    labels_txt = ", ".join(yolo_labels) if yolo_labels else "none"
+    lidar_txt = f"{int(lidar_mm)} mm" if lidar_mm is not None else "unknown"
+
+    system_prompt = (
+        "You are an assistant for a Raspberry Pi safety system. "
+        "Always respond in English. Be concise and practical."
+    )
+
+    user_prompt = (
+        "SYSTEM CONTEXT:\n"
+        f"- Current YOLO labels: {labels_txt}\n"
+        f"- Current LiDAR minimum frontal distance: {lidar_txt}\n\n"
+        "USER QUESTION:\n"
+        f"{user_question_en}\n\n"
+        "Answer in English."
+    )
+
     payload = {
         "model": CONFIG["asistente"]["ollama_model"],
         "stream": False,
         "messages": [
-            {"role": "system", "content": "Responde en español, breve y claro."},
-            {"role": "user", "content": text},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ],
     }
+
     try:
-        r = requests.post(CONFIG["asistente"]["ollama_url"], json=payload, timeout=30)
+        r = requests.post(CONFIG["asistente"]["ollama_url"], json=payload, timeout=45)
         r.raise_for_status()
         data = r.json()
         return (data.get("message", {}).get("content", "") or "").strip()
@@ -149,7 +167,6 @@ def record_wav_arecord() -> str:
         "-d", str(int(seconds)),
         wav_path
     ]
-    # Deja stderr visible si algo falla
     subprocess.run(cmd, check=True)
     return wav_path
 
@@ -171,10 +188,10 @@ def load_wav_float32(path: str) -> np.ndarray:
 
 
 # --------------------------
-# LIDAR THREAD: min distance in frontal angles only
+# LIDAR THREAD: min distance per time-window (NOT historical)
 # --------------------------
 def lidar_thread(shared: SharedState):
-    print("[LIDAR] Iniciando (mínimo por ángulo frontal)...")
+    print("[LIDAR] Iniciando (mínimo por ventana temporal, frontal)...")
     from pyrplidar import PyRPlidar
 
     port = CONFIG["lidar"]["port"]
@@ -198,30 +215,30 @@ def lidar_thread(shared: SharedState):
         try:
             lidar.connect(port=port, baudrate=baud, timeout=3)
             lidar.set_motor_pwm(pwm)
-            time.sleep(1.5)
+            time.sleep(1.2)
             gen = lidar.force_scan()
             print("[LIDAR] Conectado.")
 
-            last_pub = 0.0
-            current_min = None
+            # Windowed minimum (resets each publish interval)
+            window_min = None
+            window_start = time.time()
 
             for s in gen():
                 ang = norm(float(s.angle))
                 dist = float(s.distance)
 
                 frontal = (a1_min <= ang <= a1_max) or (a2_min <= ang <= a2_max)
-                if not frontal:
-                    continue
-                if dist <= 0 or dist > max_mm:
-                    continue
-
-                if (current_min is None) or (dist < current_min):
-                    current_min = dist
+                if frontal and (0 < dist <= max_mm):
+                    if (window_min is None) or (dist < window_min):
+                        window_min = dist
 
                 now = time.time()
-                if (now - last_pub) >= publish_every:
-                    shared.set_lidar_min(current_min)
-                    last_pub = now
+                if (now - window_start) >= publish_every:
+                    # publish current window min (can be None if nothing valid seen)
+                    shared.set_lidar_min(window_min)
+                    # reset for next window so it can "go up"
+                    window_min = None
+                    window_start = now
 
         except Exception as e:
             print(f"[LIDAR] ERROR: {e}")
@@ -246,10 +263,10 @@ def lidar_thread(shared: SharedState):
 
 
 # --------------------------
-# MAIN: YOLO loop + ALERT (TTS) + BUTTON (Whisper+Ollama+TTS)
+# MAIN
 # --------------------------
 def main():
-    print("[Main] Iniciando sistema v2...")
+    print("[Main] Iniciando sistema v3...")
 
     shared = SharedState()
     speaker = Speaker()
@@ -257,7 +274,7 @@ def main():
     # LIDAR thread
     threading.Thread(target=lidar_thread, args=(shared,), daemon=True).start()
 
-    # Whisper init (solo botón)
+    # Whisper init (button only)
     try:
         import whisper
         whisper_model = whisper.load_model(CONFIG["asistente"]["whisper_model"])
@@ -283,12 +300,13 @@ def main():
     alert_min_interval = float(CONFIG["sistema"].get("min_alert_interval_s", 2.0))
     yolo_threshold = float(CONFIG["yolo"]["threshold"])
     console_every = float(CONFIG["sistema"].get("console_every_s", 0.5))
+    show_window = bool(CONFIG["sistema"].get("show_window", True))
 
-    # ------------ BOTÓN: arecord -> whisper -> ollama -> TTS
+    # ------------ BUTTON: arecord -> whisper -> ollama(EN) -> TTS
     def on_button():
-        print("[BOTON] Presionado. Grabando con arecord...")
+        print("[BUTTON] Pressed. Recording (arecord)...")
         if whisper_model is None:
-            print("[BOTON] Whisper no está disponible.")
+            print("[BUTTON] Whisper not available.")
             return
 
         try:
@@ -296,46 +314,33 @@ def main():
             audio = load_wav_float32(wav_path)
             os.remove(wav_path)
         except Exception as e:
-            print(f"[BOTON] ERROR grabando/leyendo WAV: {e}")
+            print(f"[BUTTON] ERROR recording/reading WAV: {e}")
             return
 
         try:
-            print("[BOTON] Transcribiendo (Whisper)...")
-            r = whisper_model.transcribe(audio, fp16=False, language="es")
+            print("[BUTTON] Transcribing with Whisper...")
+            r = whisper_model.transcribe(audio, fp16=False, language="en")
             text = (r.get("text") or "").strip()
-            print("[BOTON] Texto:", text if text else "(vacío)")
+            print("[BUTTON] Transcript:", text if text else "(empty)")
         except Exception as e:
-            print(f"[BOTON] ERROR Whisper: {e}")
+            print(f"[BUTTON] ERROR Whisper: {e}")
             return
 
         if not text:
-            speaker.say("No entendí el audio.")
+            speaker.say("I did not catch that.")
             return
 
-        # Contexto mínimo: etiquetas YOLO + lidar actual
         yolo_seen = shared.get_yolo_labels()
         dmm = shared.get_lidar_min()
-        ctx = (
-            f"Etiquetas YOLO actuales: {', '.join(yolo_seen) if yolo_seen else '(ninguna)'}.\n"
-            f"Distancia mínima LiDAR frontal: {int(dmm)} mm.\n"
-        )
 
-        prompt = (
-            "Contexto del sistema:\n"
-            f"{ctx}\n"
-            f"Pregunta del usuario: {text}\n"
-            "Responde breve y útil."
-        )
-
-        resp = ask_ollama(prompt)
-        print("[Ollama] Respuesta:", resp)
+        resp = ask_ollama_english(text, yolo_seen, dmm)
+        print("[Ollama] Reply:", resp)
         speaker.say(resp)
 
     button.when_pressed = lambda: threading.Thread(target=on_button, daemon=True).start()
 
-    # ------------ LOOP YOLO + ALERTA TTS
+    # ------------ LOOP YOLO + ALERT
     last_console = 0.0
-    last_labels = []
     try:
         while True:
             frame = picam2.capture_array()
@@ -345,7 +350,6 @@ def main():
             boxes = results[0].boxes
 
             seen = set()
-            # dibujar boxes
             for i in range(len(boxes)):
                 conf = float(boxes[i].conf.item())
                 if conf < yolo_threshold:
@@ -366,20 +370,19 @@ def main():
             dmm = shared.get_lidar_min()
             now = time.time()
             if (now - last_console) >= console_every:
-                last_labels = sorted(seen)
-                print(f"[Estado] LiDAR_min_mm={int(dmm) if dmm is not None else None} | YOLO={last_labels}")
+                print(f"[State] LiDAR_min_mm={int(dmm) if dmm is not None else None} | YOLO={sorted(seen)}")
                 last_console = now
 
             # ALERTA sin Ollama: solo TTS con etiquetas + distancia
             if (dmm is not None) and (dmm < alert_mm) and shared.can_alert(alert_min_interval):
-                labels_txt = ", ".join(shared.get_yolo_labels()) if shared.get_yolo_labels() else "algo"
+                labels_txt = ", ".join(shared.get_yolo_labels()) if shared.get_yolo_labels() else "something"
                 meters = dmm / 1000.0
-                msg = f"Atención. Hay {labels_txt} a {meters:.2f} metros."
-                print("[ALERTA]", msg)
+                msg = f"Attention. I see {labels_txt} at {meters:.2f} meters."
+                print("[ALERT]", msg)
                 speaker.say(msg)
 
-            if CONFIG["sistema"].get("show_window", True):
-                cv2.imshow("Sistema v2", frame)
+            if show_window:
+                cv2.imshow("Sistema v3", frame)
                 if cv2.waitKey(1) == ord("q"):
                     break
             else:
@@ -401,5 +404,5 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nSistema detenido por el usuario.")
+        print("\nStopped by user.")
         sys.exit(0)
